@@ -1,0 +1,13 @@
+# Ignorar virtualenvs (em qualquer profundidade)
+**/venv/
+**/.venv/
+**/env/
+**/.env/
+**/ENV/
+
+# Ignorar caches/bytecode do Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd

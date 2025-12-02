@@ -1,0 +1,6 @@
+requests
+fastapi
+uvicorn
+pydantic
+qiskit
+qiskit-aer
