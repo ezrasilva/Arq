@@ -26,6 +26,7 @@ Uso:
 import os
 import time
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -37,6 +38,7 @@ from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator  # preferred for newer packaging
 
 from qiskit_aer.noise import NoiseModel, depolarizing_error
+from qiskit.qasm2.exceptions import QASM2ParseError
 
 # Configuration via env
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8000")
@@ -83,6 +85,11 @@ class SuperconductingQNode:
             "num_qubits": self.num_qubits,
             "native_gates": ["x", "y", "z", "h", "cx", "rz"],
             "api_url": self.api_url,
+            # --- ADICIONE ISTO ---
+            "avg_gate_fidelity": 1.0 - self.two_q_err, # Baseado no erro configurado
+            "avg_gate_time_ns": 50.0, # Muito rápido
+            "t1_coherence_ns": 80000.0 # ~80us
+            # ---------------------
         }
 
     def health(self) -> Dict[str, Any]:
@@ -106,7 +113,29 @@ class SuperconductingQNode:
             qc = QuantumCircuit.from_qasm_str(qasm)
         except Exception as e:
             logger.exception("Failed to parse QASM")
-            return {"status": "error", "reason": f"invalid_qasm: {e}", "slice_id": payload.get("slice_id")}
+            # fallback: many OpenQASM snippets rely on `qelib1.inc` to define gates like h,x,y,z.
+            # qiskit's parser may not resolve include paths; try to preprocess the QASM replacing
+            # common gates with built-in `u1/u2/u3` forms and remove include directives.
+            msg = str(e)
+            if isinstance(e, QASM2ParseError) or "cannot use non-builtin custom instruction" in msg:
+                try:
+                    qasm2 = re.sub(r'include\s+"qelib1.inc"\s*;', '', qasm)
+                    # replace usage of common gates with equivalent u-gates
+                    replacements = {
+                        r'\bh\s+([^;\s]+)': r'u2(0,pi) \1',
+                        r'\bx\s+([^;\s]+)': r'u3(pi,0,pi) \1',
+                        r'\by\s+([^;\s]+)': r'u3(pi/2,pi/2,pi/2) \1',
+                        r'\bz\s+([^;\s]+)': r'u1(pi) \1',
+                    }
+                    for pat, rep in replacements.items():
+                        qasm2 = re.sub(pat, rep, qasm2)
+                    qc = QuantumCircuit.from_qasm_str(qasm2)
+                    logger.info("QASM parsed after fallback preprocessing")
+                except Exception as e2:
+                    logger.exception("Fallback QASM parsing failed")
+                    return {"status": "error", "reason": f"invalid_qasm: {e2}", "slice_id": payload.get("slice_id")}
+            else:
+                return {"status": "error", "reason": f"invalid_qasm: {e}", "slice_id": payload.get("slice_id")}
 
         # transpile + execute with noise model
         start = time.time()
@@ -121,8 +150,11 @@ class SuperconductingQNode:
             return {"status": "error", "reason": f"execution_failed: {e}", "slice_id": payload.get("slice_id")}
         exec_time = time.time() - start
 
-        # naive estimated fidelity heuristic
-        estimated_fidelity = max(0.0, 1.0 - (self.single_q_err * qc.size() + self.two_q_err * qc.count_ops().get("cx", 0)))
+        # naive estimated fidelity heuristic (use number of qubits and CX count)
+        estimated_fidelity = max(
+            0.0,
+            1.0 - (self.single_q_err * qc.num_qubits + self.two_q_err * qc.count_ops().get("cx", 0)),
+        )
 
         return {
             "status": "completed",
@@ -163,4 +195,5 @@ def execute_slice(req: SliceRequest):
 # allow running via `python superconducting_qnode.py` for quick dev tests
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("qnodes.superconducting_qnode:app", host="0.0.0.0", port=API_PORT, reload=True)
+    # módulo correspondente ao caminho atual do arquivo
+    uvicorn.run("qnode.supercoducting_qnode:app", host="0.0.0.0", port=API_PORT, reload=True)

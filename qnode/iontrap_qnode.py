@@ -54,6 +54,39 @@ ION_BASE_LATENCY = float(os.getenv("ION_BASE_LATENCY", "0.05"))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("qnode.iontrap")
 
+
+def _ensure_qelib_include(qasm: str) -> str:
+    """Garantir que o QASM inclui qelib1.inc para que gates built-in sejam reconhecidos.
+    Se a inclusão estiver ausente, insere `include "qelib1.inc";` após a linha de versão
+    `OPENQASM 2.0;`. Se não houver declaração de versão, insere um cabeçalho padrão.
+    """
+    if not qasm or "qelib1.inc" in qasm:
+        return qasm
+
+    lines = qasm.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith("openqasm"):
+            # if the version line contains additional statements after the semicolon
+            # (e.g. "OPENQASM 2.0; qreg q[2]; h q[0];"), split them so the include
+            # is placed before any subsequent statements.
+            rest = ""
+            if ";" in line:
+                parts = line.split(";", 1)
+                version_part = parts[0].strip() + ";"
+                rest = parts[1].lstrip()
+                lines[i] = version_part
+                insert_at = i + 1
+                lines.insert(insert_at, 'include "qelib1.inc";')
+                if rest:
+                    # place the remainder as a new line after the include
+                    lines.insert(insert_at + 1, rest)
+            else:
+                lines.insert(i + 1, 'include "qelib1.inc";')
+            return "\n".join(lines)
+
+    header = 'OPENQASM 2.0;\ninclude "qelib1.inc";'
+    return header + "\n" + qasm
+
 # Pydantic model
 class SliceRequest(BaseModel):
     slice_id: str
@@ -88,6 +121,9 @@ class IonTrapQNode:
             "num_qubits": self.num_qubits,
             "native_gates": ["ms", "rx", "ry", "rz"],
             "api_url": self.api_url,
+            "avg_gate_fidelity": 1.0 - self.two_q_err,
+            "avg_gate_time_ns": 100000.0, # Lento (100us)
+            "t1_coherence_ns": 1000000000.0 # T1 Gigante
         }
 
     def health(self) -> Dict[str, Any]:
@@ -143,6 +179,8 @@ class IonTrapQNode:
             return {"status": "error", "reason": "not_enough_qubits", "slice_id": payload.get("slice_id")}
 
         qasm = payload.get("qasm", "")
+        # ensure commonly-missing qelib include is present so built-in gates parse
+        qasm = _ensure_qelib_include(qasm)
         try:
             qc = QuantumCircuit.from_qasm_str(qasm)
         except Exception as e:
@@ -155,6 +193,19 @@ class IonTrapQNode:
         # simulate higher latency characteristic of ion trap gates
         time.sleep(self.base_latency + 0.01 * qc_mapped.size())
 
+        # if circuit has no measurements, add measurements to all qubits
+        if qc_mapped.count_ops().get("measure", 0) == 0:
+            logger.info("No measurements found in circuit — adding measure_all()")
+            try:
+                qc_mapped.measure_all()
+            except Exception:
+                # fallback: explicitly add a classical register and measure each qubit
+                from qiskit import ClassicalRegister
+                creg = ClassicalRegister(qc_mapped.num_qubits)
+                qc_mapped.add_register(creg)
+                for i in range(qc_mapped.num_qubits):
+                    qc_mapped.measure(i, i)
+
         # execute
         start = time.time()
         try:
@@ -165,7 +216,16 @@ class IonTrapQNode:
             else:
                 job = self.backend.run(transpiled, shots=self.shots)
             result = job.result()
-            counts = result.get_counts()
+            try:
+                counts = result.get_counts()
+            except Exception as e:
+                logger.warning("No counts in result, attempting to use memory: %s", e)
+                try:
+                    memory = result.get_memory()
+                    from collections import Counter
+                    counts = dict(Counter(memory))
+                except Exception:
+                    counts = {}
         except Exception as e:
             logger.exception("Execution failed on iontrap node")
             return {"status": "error", "reason": f"execution_failed: {e}", "slice_id": payload.get("slice_id")}
@@ -173,9 +233,11 @@ class IonTrapQNode:
 
         estimated_fidelity = max(0.0, 1.0 - (self.single_q_err * qc_mapped.size() + self.two_q_err * qc_mapped.count_ops().get("cx", 0)))
 
+        # retorno formatado conforme solicitado: campos essenciais + métricas
         return {
             "status": "completed",
             "slice_id": payload.get("slice_id"),
+            "node_id": self.node_id,
             "counts": counts,
             "execution_time_s": exec_time,
             "estimated_fidelity": estimated_fidelity,

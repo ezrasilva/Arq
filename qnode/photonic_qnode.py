@@ -68,6 +68,9 @@ class PhotonicQNode:
             "num_qubits": self.num_qubits,
             "native_gates": ["bs", "phshift", "cphase"],
             "api_url": self.api_url,
+            "avg_gate_fidelity": 0.90, # Penalizado pelo PHOTON_LOSS_RATE
+            "avg_gate_time_ns": 10.0,  # O mais rápido de todos
+            "t1_coherence_ns": 1000.0  # Irrelevante (fóton voa), mas valor baixo
         }
 
     def health(self) -> Dict[str, Any]:
